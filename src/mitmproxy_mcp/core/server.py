@@ -207,9 +207,9 @@ mcp = FastMCP("Mitmproxy Manager")
 
 
 @mcp.tool()
-async def start_proxy(port: int = 8080) -> str:
+async def start_proxy(port: int = 8080, listen_host: str = "0.0.0.0") -> str:
     try:
-        return await controller.start(port=port)
+        return await controller.start(port=port, host=listen_host)
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
         return f"Couldn't start the proxy: {str(e)}"
