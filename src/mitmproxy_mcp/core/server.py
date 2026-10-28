@@ -1,8 +1,11 @@
 import asyncio
+import contextlib
+import ipaddress
 import logging
 import os
 import sys
 import json
+from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode, parse_qsl
@@ -22,6 +25,7 @@ from ..models import ScopeConfig, InterceptionRule
 from .scope import ScopeManager
 from .recorder import TrafficRecorder
 from .interceptor import TrafficInterceptor
+from .generation import normalize_scraper_flows, render_scraper_code
 
 # Configure structlog
 structlog.configure(
@@ -45,7 +49,7 @@ logger = structlog.get_logger()
 
 
 class MitmController:
-    def __init__(self):
+    def __init__(self, dump_file: Optional[str] = None):
         self.master: Optional[DumpMaster] = None
         self.proxy_task: Optional[asyncio.Task] = None
         self.scope_config = ScopeConfig()
@@ -55,6 +59,13 @@ class MitmController:
         self.running = False
         self.port = 8080
         self.session_variables = {}
+        self.dump_file = dump_file
+        self.cli_upstream_proxy: Optional[str] = None
+        self.default_port = 8080
+        self.default_host = "127.0.0.1"
+        self.auto_start = False
+        self.allow_remote_bind = False
+        self._stopping = False
 
     def _get_verify_param(self, verify_override: Optional[bool] = None) -> Any:
         if verify_override is not None:
@@ -66,12 +77,31 @@ class MitmController:
 
         return True
 
-    async def start(self, port: int = 8080, host: str = "127.0.0.1"):
+    async def start(
+        self,
+        port: int = 8080,
+        host: str = "127.0.0.1",
+        dump_file: Optional[str] = None,
+        upstream_proxy: Optional[str] = None,
+    ):
         if self.running:
             return "MITM is already running."
 
+        _validate_listen_port(port)
+        if not self.allow_remote_bind and not _is_loopback_host(host):
+            return (
+                "Refusing to bind the proxy to a non-loopback host without "
+                "explicit remote-bind authorization."
+            )
+
         self.port = port
         opts = options.Options(listen_host=host, listen_port=port)
+
+        up_proxy = upstream_proxy or self.cli_upstream_proxy
+        if up_proxy:
+            opts.update(mode=f"upstream:{up_proxy}")
+            logger.info("upstream_proxy_configured", url=up_proxy)
+
         self.master = DumpMaster(
             opts,
             with_termlog=False,
@@ -80,42 +110,115 @@ class MitmController:
         self.master.addons.add(self.recorder)
         self.master.addons.add(self.interceptor)
 
+        save_path = dump_file or self.dump_file
+        if save_path:
+            try:
+                resolved_target = _validate_contained_path(save_path, allow_append_prefix=True)
+                save_path_opts = f"+{resolved_target}" if save_path.startswith("+") else str(resolved_target)
+            except PermissionError as e:
+                logger.error("proxy_start_path_denied", path=save_path, error=str(e))
+                return json.dumps({
+                    "status": "error",
+                    "message": str(e),
+                })
+            except Exception as e:
+                logger.error("proxy_start_path_invalid", path=save_path, error=str(e))
+                return json.dumps({
+                    "status": "error",
+                    "message": f"Invalid path: {str(e)}",
+                })
+            opts.update(save_stream_file=save_path_opts)
+            logger.info("flow_dump_enabled", path=save_path_opts)
+
+        # pre-check: fail fast if the port is taken. mitmproxy's master.run() dies
+        # async with SystemExit on bind failure, which would otherwise leave a false
+        # "Started" + running=True. A synchronous probe bind is deterministic.
+        import socket
+
+        probe = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((host, port))
+        except OSError as e:
+            probe.close()
+            self.master = None
+            logger.error("proxy_start_failed", host=host, port=port, error=str(e))
+            return f"Couldn't start the proxy on {host}:{port}: {e}"
+        finally:
+            probe.close()
+
+        self._stopping = False
         self.proxy_task = asyncio.create_task(self.master.run())
+        self.proxy_task.add_done_callback(self._proxy_task_done)
         self.running = True
         logger.info("proxy_started", host=host, port=port)
-        return f"Started proxy on port {port}"
+        msg = f"Started proxy on port {port}"
+        if save_path:
+            msg += f", dumping flows to {save_path}"
+        return msg
+
+    def _proxy_task_done(self, task: asyncio.Task) -> None:
+        """Observe unexpected proxy task failures and clear stale state."""
+        if self._stopping:
+            try:
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = None
+        self.running = False
+        self.master = None
+        self.proxy_task = None
+        if error is not None:
+            logger.error("proxy_task_failed", error=str(error))
+        else:
+            logger.warning("proxy_stopped_unexpectedly")
 
     async def stop(self):
         if not self.running or not self.master:
             return "The proxy isn't running right now."
-        # Explicitly stop all server instances to release the listening port
-        # and close all active connections (keepalive connections otherwise persist)
-        ps_addon = self.master.addons.get("proxyserver")
-        if ps_addon:
-            for handler in list(ps_addon.connections.values()):
-                try:
-                    for transport_io in list(handler.transports.values()):
-                        if transport_io.writer and not transport_io.writer.is_closing():
-                            transport_io.writer.close()
-                except Exception:
-                    pass
-            for instance in list(ps_addon.servers._instances.values()):
-                try:
-                    await instance.stop()
-                except Exception:
-                    pass
-            ps_addon.servers._instances.clear()
-        self.master.shutdown()
-        if self.proxy_task:
-            done, _ = await asyncio.wait({self.proxy_task}, timeout=5.0)
-            if not done:
-                self.proxy_task.cancel()
-                try:
-                    await self.proxy_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+        self._stopping = True
+        master = self.master
+        proxy_task = self.proxy_task
+        try:
+            # Explicitly stop all server instances to release the listening port
+            # and close all active connections (keepalive connections otherwise persist)
+            ps_addon = master.addons.get("proxyserver")
+            if ps_addon:
+                for handler in list(ps_addon.connections.values()):
+                    try:
+                        for transport_io in list(handler.transports.values()):
+                            if transport_io.writer and not transport_io.writer.is_closing():
+                                transport_io.writer.close()
+                    except Exception:
+                        pass
+                for instance in list(ps_addon.servers._instances.values()):
+                    try:
+                        await instance.stop()
+                    except Exception:
+                        pass
+                ps_addon.servers._instances.clear()
+            master.shutdown()
+            if proxy_task:
+                done, _ = await asyncio.wait({proxy_task}, timeout=5.0)
+                if not done:
+                    proxy_task.cancel()
+                    try:
+                        await proxy_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    try:
+                        proxy_task.exception()
+                    except asyncio.CancelledError:
+                        pass
+        finally:
             self.proxy_task = None
-        self.running = False
+            self.running = False
+            self.master = None
+            self._stopping = False
         logger.info("proxy_stopped")
         return "Stopped the proxy."
 
@@ -201,15 +304,91 @@ class MitmController:
 # Global Controller Instance
 controller = MitmController()
 
-mcp = FastMCP("Mitmproxy Manager")
+
+def _validate_contained_path(
+    path_str: str,
+    base_dir: Optional[Path] = None,
+    allow_append_prefix: bool = False,
+) -> Path:
+    if not path_str or not isinstance(path_str, str):
+        raise ValueError("path cannot be empty")
+
+    raw = path_str
+    if allow_append_prefix and raw.startswith("+"):
+        raw = raw[1:]
+
+    if not raw:
+        raise ValueError("path cannot be empty")
+
+    base = (base_dir or Path.cwd()).resolve()
+    target = Path(raw).resolve()
+
+    if not target.is_relative_to(base):
+        raise PermissionError(
+            f"Security Error: Access denied to {path_str}. Path must be within the project directory."
+        )
+    return target
+
+
+def _validate_listen_port(port: int) -> None:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("listen port must be an integer between 1 and 65535")
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_server: FastMCP):
+    """Auto-start the proxy on boot when --auto-start / MITMPROXY_AUTO_START is set."""
+    try:
+        if getattr(controller, "auto_start", False) and not controller.running:
+            result = await controller.start(
+                port=controller.default_port,
+                host=controller.default_host,
+            )
+            if not controller.running:
+                raise RuntimeError(f"Proxy auto-start failed: {result}")
+            logger.info("auto_start", result=result)
+        yield
+    finally:
+        if controller.running:
+            await controller.stop()
+
+
+mcp = FastMCP("Mitmproxy Manager", lifespan=_lifespan)
 
 # --- MCP Tools ---
 
 
 @mcp.tool()
-async def start_proxy(port: int = 8080, listen_host: str = "0.0.0.0") -> str:
+async def start_proxy(
+    port: Optional[int] = None,
+    dump_file: Optional[str] = None,
+    upstream_proxy: Optional[str] = None,
+) -> str:
+    """
+    Start the mitmproxy instance.
+    Args:
+        port: Port to listen on. Omit to use the server's configured default
+            (--port / MITMPROXY_PORT, else 8080).
+        dump_file: Optional file path to save raw mitmproxy .flow data.
+            Prefix with + to append to an existing file.
+        upstream_proxy: Optional upstream proxy URL (e.g., 'http://user:pass@proxy:port').
+    """
     try:
-        return await controller.start(port=port, host=listen_host)
+        return await controller.start(
+            port=port if port is not None else controller.default_port,
+            host=controller.default_host,
+            dump_file=dump_file,
+            upstream_proxy=upstream_proxy,
+        )
     except Exception as e:
         logger.error("proxy_start_failed", error=str(e))
         return f"Couldn't start the proxy: {str(e)}"
@@ -308,9 +487,7 @@ async def inspect_flows(
     if columns and "id" not in columns:
         columns.insert(0, "id")
 
-    results = controller.recorder.db.get_by_ids(
-        ids, columns=columns, ordered_headers=True
-    )
+    results = controller.recorder.db.get_by_ids(ids, columns=columns, ordered_headers=True)
 
     if derived_fields:
         for entry in results:
@@ -402,13 +579,25 @@ async def load_traffic_file(
         scope: Comma-separated list of domains to filter by during import.
             Only flows matching these domains are imported.
     """
-    scope_list = (
-        [d.strip() for d in scope.split(",") if d.strip()] if scope else None
-    )
+    scope_list = [d.strip() for d in scope.split(",") if d.strip()] if scope else None
+
+    # Security: Prevent path traversal and restrict to working directory
+    try:
+        requested_path = _validate_contained_path(file_path, allow_append_prefix=False)
+    except PermissionError as e:
+        return json.dumps({
+            "status": "error",
+            "message": str(e),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Invalid path: {str(e)}"})
+
     try:
         stats = await asyncio.to_thread(
             controller.recorder.db.import_from_file,
-            file_path, append=append, scope=scope_list
+            str(requested_path),
+            append=append,
+            scope=scope_list,
         )
         return json.dumps(
             {
@@ -599,14 +788,14 @@ async def fuzz_endpoint(
 
     # Get baseline response for anomaly detection
     try:
-        baseline_flow = controller.recorder.db.get_flow_object(flow_id)
-        if baseline_flow and baseline_flow.response:
-            baseline_status = baseline_flow.response.status_code
+        baseline_resp = flow_data.get("response") if flow_data else None
+        if baseline_resp and baseline_resp.get("status_code") is not None:
+            baseline_status = baseline_resp["status_code"]
         else:
             baseline_status = 200
 
-        if baseline_flow and baseline_flow.response and baseline_flow.response.content:
-            baseline_len = len(baseline_flow.response.content)
+        if baseline_resp and baseline_resp.get("body_preview"):
+            baseline_len = len(baseline_resp["body_preview"])
         else:
             baseline_len = 0
     except Exception:
@@ -1180,8 +1369,7 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
     flow IDs.
     Args:
         flow_ids: Comma-separated list of flow IDs to include in the script.
-        target_framework: The framework to generate code for (TODO: Add
-        additional frameworks: Only 'curl_cffi' is currently supported).
+        target_framework: The framework to generate code for.
     """
     ids = [fid.strip() for fid in flow_ids.split(",") if fid.strip()]
     flows_data = []
@@ -1194,320 +1382,83 @@ async def generate_scraper_code(flow_ids: str, target_framework: str = "curl_cff
     if not flows_data:
         return "No valid flows found for the provided IDs."
 
-    if target_framework == "curl_cffi":
-        code = [
-            "import asyncio",
-            "import json",
-            "from curl_cffi.requests import AsyncSession",
-            "",
-            "async def run_scraper():",
-            "    # Generated by mitmproxy-mcp",
-            "    async with AsyncSession(",
-            "        impersonate='chrome120', verify=False",
-            "    ) as client:",
-        ]
-
-        for i, flow in enumerate(flows_data):
-            req = flow["request"]
-            url = req["url"]
-            method = req["method"]
-
-            headers = dict(req["headers"])
-            headers.pop("Host", None)
-            headers.pop("Content-Length", None)
-            headers.pop("Content-Encoding", None)
-
-            # Prefer richer in-memory flow object when available,
-            # then DB fallback.
-            body = req.get("body_preview")
-
-            live_flow = controller.recorder.get_live_flow(flow["id"])
-            if live_flow and live_flow.request and live_flow.request.content:
-                try:
-                    body = live_flow.request.content.decode("utf-8")
-                except UnicodeDecodeError:
-                    body = body or "<binary data omitted>"
-            else:
-                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
-                if flow_obj and flow_obj.body:
-                    body = flow_obj.body
-
-            safe_method = json.dumps(method)
-            safe_url = json.dumps(url)
-            safe_url_preview = json.dumps(url[:50])
-            step_line = f"        print(f'\\n[Step {i + 1}] Executing ' + {safe_method} + ' ' + {safe_url_preview} + '...')"
-            code.append(step_line)
-
-            headers_str = json.dumps(headers, indent=12).strip()
-            # Indent subsequent lines
-            headers_str = headers_str.replace("\n", "\n        ")
-
-            code.append(f"        headers_{i} = {headers_str}")
+    normalized_flows = normalize_scraper_flows(flows_data, controller.recorder)
+    return render_scraper_code(target_framework, normalized_flows)
 
 
-            kwargs = f"method={safe_method}, url={safe_url}, headers=headers_{i}"
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var (1/true/yes/on are truthy, case-insensitive)."""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
-            if body and body != "<binary data omitted>":
-                # Escape quotes
-                safe_body = json.dumps(body)
-                code.append(f"        data_{i} = {safe_body}")
-                kwargs += f", data=data_{i}"
 
-            code.append("        try:")
-            code.append(f"            response_{i} = await client.request({kwargs})")
-            code.append(f"            print(f'Status: {{response_{i}.status_code}}')")
-            code.append(f"            # print(response_{i}.text[:200])")
-            code.append(f"        except Exception as e:")
-            code.append(f"            print(f'Error: {{e}}')")
-            code.append("")
-
-        code.extend(
-            [
-                "if __name__ == '__main__':",
-                "    asyncio.run(run_scraper())",
-            ]
-        )
-
-        return "\n".join(code)
-
-    elif target_framework == "requests":
-        code = [
-            "import json",
-            "import requests",
-            "",
-            "def run_scraper():",
-            "    # Generated by mitmproxy-mcp",
-            "    # Note: requests does not impersonate browser fingerprints like curl_cffi",
-            "    with requests.Session() as client:",
-            "        client.verify = False  # Ignore SSL warnings",
-        ]
-
-        for i, flow in enumerate(flows_data):
-            req = flow["request"]
-            url = req["url"]
-            method = req["method"]
-
-            headers = dict(req["headers"])
-            headers.pop("Host", None)
-            headers.pop("Content-Length", None)
-            headers.pop("Content-Encoding", None)
-
-            body = req.get("body_preview")
-            live_flow = controller.recorder.get_live_flow(flow["id"])
-            if live_flow and live_flow.request and live_flow.request.content:
-                try:
-                    body = live_flow.request.content.decode("utf-8")
-                except UnicodeDecodeError:
-                    body = body or "<binary data omitted>"
-            else:
-                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
-                if flow_obj and flow_obj.body:
-                    body = flow_obj.body
-
-            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
-            code.append(step_line)
-
-            headers_str = json.dumps(headers, indent=12).strip()
-            headers_str = headers_str.replace("\n", "\n        ")
-            code.append(f"        headers_{i} = {headers_str}")
-
-            safe_url = json.dumps(url)
-            safe_method = json.dumps(method)
-            kwargs = f"method={safe_method}, url={safe_url}, headers=headers_{i}, timeout=30"
-
-            if body and body != "<binary data omitted>":
-                safe_body = json.dumps(body)
-                code.append(f"        data_{i} = {safe_body}")
-                kwargs += f", data=data_{i}"
-
-            code.append("        try:")
-            code.append(f"            response_{i} = client.request({kwargs})")
-            code.append(f"            print(f'Status: {{response_{i}.status_code}}')")
-            code.append(f"            # print(response_{i}.text[:200])")
-            code.append("        except Exception as e:")
-            code.append("            print(f'Error: {e}')")
-            code.append("")
-
-        code.extend(
-            [
-                "if __name__ == '__main__':",
-                "    import urllib3",
-                "    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)",
-                "    run_scraper()",
-            ]
-        )
-
-        return "\n".join(code)
-
-    elif target_framework == "aiohttp":
-        code = [
-            "import asyncio",
-            "import json",
-            "import aiohttp",
-            "",
-            "async def run_scraper():",
-            "    # Generated by mitmproxy-mcp",
-            "    # Note: aiohttp does not impersonate browser fingerprints like curl_cffi",
-            "    timeout = aiohttp.ClientTimeout(total=30)",
-            "    connector = aiohttp.TCPConnector(verify_ssl=False)",
-            "    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as client:",
-        ]
-
-        for i, flow in enumerate(flows_data):
-            req = flow["request"]
-            url = req["url"]
-            method = req["method"]
-
-            headers = dict(req["headers"])
-            headers.pop("Host", None)
-            headers.pop("Content-Length", None)
-            headers.pop("Content-Encoding", None)
-
-            body = req.get("body_preview")
-            live_flow = controller.recorder.get_live_flow(flow["id"])
-            if live_flow and live_flow.request and live_flow.request.content:
-                try:
-                    body = live_flow.request.content.decode("utf-8")
-                except UnicodeDecodeError:
-                    body = body or "<binary data omitted>"
-            else:
-                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
-                if flow_obj and flow_obj.body:
-                    body = flow_obj.body
-
-            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
-            code.append(step_line)
-
-            headers_str = json.dumps(headers, indent=12).strip()
-            headers_str = headers_str.replace("\n", "\n        ")
-            code.append(f"        headers_{i} = {headers_str}")
-
-            safe_url = json.dumps(url)
-            safe_method = json.dumps(method)
-            kwargs = f"url={safe_url}, headers=headers_{i}"
-
-            if body and body != "<binary data omitted>":
-                safe_body = json.dumps(body)
-                code.append(f"        data_{i} = {safe_body}")
-                kwargs += f", data=data_{i}"
-
-            code.append(f"        try:")
-            code.append(
-                f"            async with client.request({safe_method}, {kwargs}) as response_{i}:"
-            )
-            code.append(f"                print(f'Status: {{response_{i}.status}}')")
-            code.append(f"                text_{i} = await response_{i}.text()")
-            code.append(f"                # print(text_{i}[:200])")
-            code.append(f"        except Exception as e:")
-            code.append(f"            print(f'Error: {{e}}')")
-            code.append("")
-
-        code.extend(
-            [
-                "if __name__ == '__main__':",
-                "    asyncio.run(run_scraper())",
-            ]
-        )
-
-        return "\n".join(code)
-
-    elif target_framework == "playwright":
-        code = [
-            "import asyncio",
-            "import json",
-            "from playwright.async_api import async_playwright",
-            "",
-            "async def run_scraper():",
-            "    # Generated by mitmproxy-mcp",
-            "    async with async_playwright() as p:",
-            "        browser = await p.chromium.launch(headless=True)",
-            "        # Use a context to preserve cookies and session state across requests",
-            "        context = await browser.new_context(ignore_https_errors=True)",
-            "        page = await context.new_page()",
-            "        page.set_default_timeout(30000)",
-        ]
-
-        for i, flow in enumerate(flows_data):
-            req = flow["request"]
-            url = req["url"]
-            method = req["method"]
-
-            headers = dict(req["headers"])
-            headers.pop("Host", None)
-            headers.pop("Content-Length", None)
-            headers.pop("Content-Encoding", None)
-
-            # Determine if this looks like a browser navigation or an API call
-            accept_header = headers.get("Accept") or headers.get("accept") or ""
-            is_navigation = method.upper() == "GET" and "text/html" in str(accept_header)
-
-            body = req.get("body_preview")
-            live_flow = controller.recorder.get_live_flow(flow["id"])
-            if live_flow and live_flow.request and live_flow.request.content:
-                try:
-                    body = live_flow.request.content.decode("utf-8")
-                except UnicodeDecodeError:
-                    body = body or "<binary data omitted>"
-            else:
-                flow_obj = controller.recorder.db.get_flow_object(flow["id"])
-                if flow_obj and flow_obj.body:
-                    body = flow_obj.body
-
-            step_line = f"        print(f'\\n[Step {i + 1}] Executing {method} {url[:50]}...')"
-            code.append(step_line)
-
-            headers_str = json.dumps(headers, indent=12).strip()
-            headers_str = headers_str.replace("\n", "\n        ")
-            code.append(f"        headers_{i} = {headers_str}")
-
-            safe_url = json.dumps(url)
-            safe_method = json.dumps(method)
-
-            if is_navigation:
-                code.append(f"        try:")
-                code.append(f"            # Attempting to navigate the page directly")
-                code.append(f"            response_{i} = await page.goto({safe_url})")
-                code.append(
-                    f"            print(f'Status: {{response_{i}.status if response_{i} else \"Unknown\"}}')"
-                )
-                code.append(f"            # content_{i} = await page.content()")
-                code.append(f"            # print(content_{i}[:200])")
-                code.append(f"        except Exception as e:")
-                code.append(f"            print(f'Error: {{e}}')")
-            else:
-                kwargs = f"{safe_url}, method={safe_method}, headers=headers_{i}"
-                if body and body != "<binary data omitted>":
-                    safe_body = json.dumps(body)
-                    code.append(f"        data_{i} = {safe_body}")
-                    kwargs += f", data=data_{i}"
-
-                code.append(f"        try:")
-                code.append(f"            response_{i} = await context.request.fetch({kwargs})")
-                code.append(f"            print(f'Status: {{response_{i}.status}}')")
-                code.append(f"            # text_{i} = await response_{i}.text()")
-                code.append(f"            # print(text_{i}[:200])")
-                code.append(f"        except Exception as e:")
-                code.append(f"            print(f'Error: {{e}}')")
-
-            code.append("")
-
-        code.extend(
-            [
-                "        await browser.close()",
-                "",
-                "if __name__ == '__main__':",
-                "    asyncio.run(run_scraper())",
-            ]
-        )
-
-        return "\n".join(code)
-
-    else:
-        return f"Framework '{target_framework}' is not supported yet."
+def _parse_port(value: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("listen port must be an integer between 1 and 65535") from exc
+    _validate_listen_port(port)
+    return port
 
 
 def start():
     """Entry point for running the server directly."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="mitmproxy-mcp server")
+    parser.add_argument(
+        "--dump-file",
+        default=os.environ.get("MITMPROXY_DUMP_FILE"),
+        help="Path to save raw .flow data. Prefix with + to append. "
+        "Can also be set via MITMPROXY_DUMP_FILE env var.",
+    )
+    parser.add_argument(
+        "--upstream-proxy",
+        default=os.environ.get("MITMPROXY_UPSTREAM_PROXY"),
+        help="Upstream proxy URL (e.g., http://user:pass@proxy:port). "
+        "Can also be set via MITMPROXY_UPSTREAM_PROXY env var.",
+    )
+    parser.add_argument(
+        "--port",
+        type=_parse_port,
+        default=_parse_port(os.environ.get("MITMPROXY_PORT", "8080")),
+        help="Default proxy listen port used by start_proxy and --auto-start "
+        "(default 8080). Can also be set via MITMPROXY_PORT env var.",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MITMPROXY_HOST", "127.0.0.1"),
+        help="Default proxy listen host (default 127.0.0.1). "
+        "Can also be set via MITMPROXY_HOST env var.",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        default=_env_flag("MITMPROXY_AUTO_START"),
+        help="Start the proxy immediately on server startup instead of waiting "
+        "for the start_proxy tool. Can also be set via MITMPROXY_AUTO_START env var.",
+    )
+    parser.add_argument(
+        "--allow-remote-bind",
+        action="store_true",
+        default=_env_flag("MITMPROXY_ALLOW_REMOTE_BIND"),
+        help="Allow binding the proxy to a non-loopback host. Can also be set via "
+        "MITMPROXY_ALLOW_REMOTE_BIND env var.",
+    )
+    args, _ = parser.parse_known_args()
+
+    global controller
+    controller = MitmController(dump_file=args.dump_file)
+    controller.cli_upstream_proxy = args.upstream_proxy
+    # start_proxy() and --auto-start fall back to these when no port is passed,
+    # so a wrapper can pin a per-agent port that the browser also targets.
+    controller.default_port = args.port
+    controller.default_host = args.host
+    controller.auto_start = args.auto_start
+    controller.allow_remote_bind = args.allow_remote_bind
+
     mcp.run()
 
 
